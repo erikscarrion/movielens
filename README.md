@@ -1,2 +1,2 @@
 # movielens
-Capstone project 1 of 2
+The report and associated code files were written as part of the Harvard EdX Data Science Certificate program. This project develops an additive ensemble model to predict movie ratings using the movielens 10M dataset. Base user and movie effects are estimated using a mean-effects approach while local polynomial regression, implemented via the gam and loess algorithms, is used to estimate the non-linear effect of time. 
