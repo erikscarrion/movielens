@@ -1,0 +1,908 @@
+---
+title: 'Capstone Project Movie Ratings'
+author: "Erik Carrion"
+date: "2023-09-18"
+output: 
+  pdf_document: default 
+subtitle: HarvardX Data Science Certificate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(tinytex)
+library(data.table)
+library(ggthemes)
+library(strex)
+library(locfit)
+library(mgcv)
+library(colorspace)
+library(gganimate)
+library(reshape)
+library(reshape2)
+
+load("capstone_workspace_final.RData")
+
+invisible(gc())
+```
+
+
+# Introduction
+
+The purpose of this project is to develop a predictive model for movie ratings using the Movielens 10M dataset which has a combined 10 million observations across 12,145 unique movies and 69,892 unique user id's. Our final model takes the following form:$R = \mu_{..} + c*[b^*_m + b^*_m + f(t)] + \epsilon$. The model is composed of 4 parts: the grand mean of all ratings, $\mu_{..}$, the regularized effect for users and movies ($b^*_m$ & $b^*_u$), and a smooth functions of time, $f(t)$ The 2nd half of the model, $f(t)$, is a smooth function of time. Finally, $c$ is a scale factor s.t. $c > 0$.
+
+We commence our discussion with an exploratory analysis of the dataset before moving on to model development and optimization. Finally, we'll conclude with a summary of our results.
+
+# Exploratory Analysis
+
+## Rating Distribution & Summary Statistics
+The distribution of the raw ratings data is asymmetric and left-tailed. In general, users appear generous in their ratings, with 82% of ratings being a 3 or better. Whole number ratings are far more prevalent, outnumbering half-number ratings 3.8:1. The magnitude of this imbalance is visualized below. We see there are 309% more movies rated a 1 than a 0.5 and 568% more movies rated a 2 than a 1.5.
+
+```{r ratings-histogram, echo = F, message = F, warning = F}
+train %>%
+  group_by(rating) %>%
+  summarize(n = n()) %>% 
+  ggplot(aes(x = factor(rating))) +
+  geom_bar(aes(y = n/1e5),
+           stat = "identity",
+           color = "black",
+           fill = "#648FFF") +
+  labs(title = "Distribution of Ratings", 
+       x = "Rating", 
+       y = "Count (in 100k)") +
+  theme_bw()
+```
+```{r rating-differences, echo = F, message = F, warning = F}
+tibble(whole_number = c(1, 2, 3, 4, 5),
+         half_number = c(0.5, 1.5, 2.5, 3.5, 4.5),
+         difference = 100*c((mean(train$rating == 1)/mean(train$rating == 0.5)) - 1, 
+                            (mean(train$rating == 2)/mean(train$rating == 1.5)) - 1, 
+                            (mean(train$rating == 3)/mean(train$rating == 2.5)) - 1, 
+                            (mean(train$rating == 4)/mean(train$rating == 3.5)) - 1, 
+                            (mean(train$rating == 5)/mean(train$rating == 4.5)) - 1
+)) %>% 
+  ggplot(aes(whole_number, difference)) +
+  geom_bar(fill = hist.fill, color = "black", stat = "identity") +
+  theme_bw() +
+  labs(title = "Whole-Number vs. Half-Number Ratings",
+       x = "Rating", y = "% increase",
+       caption = "Data: Movielens 10M")
+
+invisible(invisible(gc()))
+
+```
+
+```{r misc rating stats, echo = F, message = F, warning = F}
+whole_nums = sum(train$rating %in% c(1,2,3,4,5))
+half_nums = sum(train$rating %in% c(0.5, 1.5, 2.5, 3.5, 4.5))
+whole_vs_half.odds <- round((whole_nums/half_nums),2)
+
+glue::glue("Percentage of movies rated 3 or better:       {round(mean(train$rating >= 2.5),2)}")
+glue::glue("Ratio of whole-number to half-number ratings: {round((whole_nums/half_nums),2)} ")
+
+rm(whole_nums, half_nums, whole_vs_half.odds)
+```
+
+## Distribution of Reviews - Users & Movies
+Both users and movies exhibit highly right tailed distributions. Lots of users and movies have relatively few reviews while very few users and movies have significant numbers of reviews. 
+```{r user-movie-histogram, echo = F, message = F, warning = F, fig.align = "center"}
+users_num_reviews = 
+  train %>% 
+  group_by(userID) %>% 
+  summarize(nrev.user = n())
+
+movies_num_reviews = 
+  train %>% 
+  group_by(movieID) %>% 
+  summarize(nrev.movie = n())
+
+## Friedman-Diaconis Histogram Binwidth
+user_bw = 2*(IQR(users_num_reviews$nrev.user))/(nrow(users_num_reviews)^(1/3))
+movie_bw = 2*(IQR(movies_num_reviews$nrev.movie))/(nrow(movies_num_reviews)^(1/3))
+
+user.hist = 
+  users_num_reviews %>% 
+  ggplot(aes(nrev.user)) +
+  geom_histogram(fill = hist.fill,
+                 color = "black",
+                 bins = 50) +
+  labs(title = "Histogram: Number of User Ratings",
+       caption = "Dataset: Movielens 10M",
+       x = "No. of Reviews") +
+  theme(plot.caption.position = 'plot')
+
+movie.hist = 
+  movies_num_reviews %>% 
+  ggplot(aes(nrev.movie)) +
+  geom_histogram(fill = hist.fill,
+                 color = "black",
+                 bins = 50) +
+  labs(title = "Histogram: Number of Movie Ratings",
+       caption = "Dataset: Movielens 10M",
+       x = "No. of Reviews") +
+  theme(plot.caption.position = 'plot')
+
+user.hist 
+
+```
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+
+movie.hist
+```
+
+For our model to be accurate, we want each user and movie to have enough ratings in order to make an accurate estimate of their respective effects. If a user only has 2 observations, we're unlikely to make a good estimate of his or her effect. Likewise for movies. 
+
+Requiring a minimum number of observations has to balanced against data loss. As we increase the minimum number of reviews, we see a sharp loss in both users and movies from the dataset. These lost users and movies make up an ever growing proportion of the training set. We therefore have to balance our minimum number of reviews against user, movie, and data loss.
+
+```{r more-than-n-reviews, echo = F, message = F, warning = F, fig.align = "center"}
+nrev.df = 
+  tibble(nrev = seq(10, 500, by = 10)) %>% 
+  mutate(users = sapply(nrev, 
+                        \(min){
+                          mean(users_num_reviews >= min)
+                        }),
+         movies = sapply(nrev, 
+                         \(min){
+                           mean(movies_num_reviews >= min)
+                         })) 
+
+nrev.df %>% 
+  ggplot() +
+  geom_line(aes(nrev, users*100, color = "tomato"), linewidth = 1.5) +
+  geom_line(aes(nrev, movies*100, color = "blue"), linewidth = 1.5) +
+  scale_color_manual(labels = c("users", "movies"), values = c("tomato", "blue")) +
+  labs(title = "Percentage of users & movies\nWith more than N reviews",
+       x = "n reviews", y = "percentage", color = "Legend") +
+  theme_bw()
+
+rm(nrev.df)
+invisible(invisible(gc()))
+```
+
+## Genres
+After limiting genres to a maximum of 4 genres, there are 684 distinct genres. In comparison to a normal distribution, average ratings by genre are left skewed, peaks higher, and is more tightly clustered about its mean than we expect under normality. 
+
+```{r genre_ratings_histogram, echo = F, message = F, warning = F, fig.align = "center"}
+genre.ratings = 
+  train %>% 
+  group_by(genre) %>% 
+  summarize(rating = mean(rating))
+
+suppressWarnings(set.seed(4242, sample.kind = "Rounding"))
+# Friedman Diaconis Binwidth
+genre_bw = 2*(IQR(genre.ratings$rating))/(nrow(genre.ratings)^(1/3))
+
+# plot
+genre.ratings %>% 
+  mutate(norm.data = rnorm(mean = mean(genre.ratings$rating),
+                           sd = sd(genre.ratings$rating),
+                           n = nrow(genre.ratings))) %>% 
+  ggplot() + 
+  geom_histogram(aes(rating,fill = hist.fill), 
+                 color = "black", 
+                 binwidth = genre_bw) +
+  geom_histogram(aes(norm.data, fill = norm.fill), 
+                 color = "black", alpha = 0.35,
+                 binwidth = genre_bw) +
+  scale_fill_manual(labels = c("Actual", "Simulated"),
+                    values = c(hist.fill, norm.fill)) +
+  theme_bw() +
+  labs(title = "Distribution of Ratings - Grouped by Genre",
+       subtitle = "Compared to simulated data",
+       fill = "Data Source",
+       x = "Avg. Rating", caption = "Data: Movielens 10M")
+invisible(gc)
+rm(genre.ratings, genre_bw)
+```
+Further, we see a longer and taller left tail and a slimmer and slightly shorter right tail. This leads us to the ratings themselves and the worst and best genres. Looking at the bottom 5, most have an element of horror while in the top 5 animation, action, and adventure are prevalent.
+
+```{r bottom_10_genres, echo = F}
+train %>% 
+  group_by(genre) %>% 
+  summarize(rating = mean(rating)) %>% 
+  slice_min(rating, n = 5) %>% 
+  as_tibble() 
+```
+
+```{r top_10_genres, echo = F}
+train %>% 
+  group_by(genre) %>% 
+  summarize(rating = mean(rating)) %>% 
+  slice_max(rating, n = 5) %>% 
+  as_tibble()
+```
+## Users & Movies
+The distribution of average ratings for users and movies is approximately normal with the distribution for users more so than for movies. The distribution of mean rating by movieID bears similarities to that for genre.
+
+```{r user-ratings-hist, echo = F, message = F, warning = F, fig.align = "center"}
+user_ratings <- 
+  train %>% 
+  group_by(userID) %>% 
+  summarize(rating = mean(rating))
+
+user_bw <- 2*(IQR(user_ratings$rating))/(nrow(user_ratings)^(1/3))
+
+user_ratings %>%
+  mutate(norm.data = rnorm(mean = mean(user_ratings$rating),
+                           sd = sd(user_ratings$rating),
+                           n = nrow(user_ratings))) %>% 
+  ggplot() +
+  geom_histogram(aes(rating, fill = hist.fill),
+                 color = "black") +
+  geom_histogram(aes(norm.data, fill = norm.fill), 
+                 color = "black", alpha = 0.35) +
+  scale_fill_manual(labels = c("Actual", "Simulated"),
+                    values = c(hist.fill, norm.fill)) +
+  theme_bw() +
+  labs(title = "Distribution of Ratings - Grouped by User",
+       subtitle = "Compared to simulated data",
+       fill = "Data Source",
+       x = "Avg. Rating", caption = "Data: Movielens 10M")
+
+rm(user_ratings, user_bw)
+invisible(invisible(gc()))
+```
+```{r movie-rating-dist, echo = F, message = F, warning = F, fig.align = "center"}
+# Movies Average Ratings
+movie_ratings = 
+  train %>% 
+  group_by(movieID) %>% 
+  summarize(rating = mean(rating))
+
+movie_bw = 2*(IQR(movie_ratings$rating))/(nrow(movie_ratings)^(1/3))
+
+movie_ratings %>%
+  mutate(norm.data = rnorm(mean = mean(movie_ratings$rating),
+                           sd = sd(movie_ratings$rating),
+                           n = nrow(movie_ratings))) %>% 
+  ggplot() +
+  geom_histogram(aes(rating, fill = hist.fill),
+                 color = "black", 
+                 binwidth = movie_bw) +
+  geom_histogram(aes(norm.data, fill = norm.fill), 
+                 color = "black", alpha = 0.35,
+                 binwidth = movie_bw) +
+  scale_fill_manual(labels = c("Actual", "Simulated"),
+                    values = c(hist.fill, norm.fill)) +
+  theme_bw() +
+  labs(title = "Distribution of Ratings - Grouped by Movie",
+       subtitle = "Compared to simulated data",
+       fill = "Data Source",
+       x = "Avg. Rating", caption = "Data: Movielens 10M")
+rm(movie_ratings, movie_bw)
+invisible(invisible(gc()))
+```
+## Ratings Over Time
+Aside from release year, we can extract the year, month, day, week, and hour of review from the timestamp, allowing us to consider ratings from across a number of different facets.
+
+### Time Effect: Release Year
+First, we consider how the mean rating changes by release year. Immediately, we see a clear non-linear relationship between the average rating and the year of release. We see that for movies made prior to 1990, ratings were generally above the mean, whereas afterwards we see a decline. Does this imply that movies released before 1990 were really that much better?
+```{r avg-rating-rel.year, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  group_by(year) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(year, rating)) +
+  geom_point(shape = 21, fill = hist.fill, color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red") +
+  labs(title = "Mean Rating by Release Year",
+       x = "Release Year", y = "Rating") +
+  theme_bw()
+invisible(invisible(gc()))
+```
+
+### Time Effect: Review Year
+Moving on to year of review, after we filter out the 1 review entered in 1995, we see the following relationship. Again, there is clearly a non-linear relationship between the average rating and the year the rating was submitted. 
+```{r avg-rating-rev.year, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  # only 1 review in 1995
+  filter(rev.year > 1995) %>% 
+  group_by(rev.year) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(rev.year, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red") +
+  labs(title = "Mean Rating by Review Year",
+       x = "Review Year", y = "Rating") +
+  theme_bw()
+```
+
+### Time Effect: Years Since Release
+Differences play an important role in analysis. In our case, we can ask if a pattern emerges when we consider the difference in time between a movie's release and a rating's submission. We see there is a parabolic effect with the average rating peaking between 50 and 60 years from the year of release. 
+
+```{r avg-rating-time-since, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  mutate(time.since = rev.year - year) %>% 
+  group_by(time.since) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(time.since, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red") +
+  labs(title = "Mean Rating by Time Since Release",
+       x = "Review Year - Release Year", y = "Rating") +
+  theme_bw()
+```
+### Time Effect: Review Month
+When it comes to the month a review was made, there seems to be a non-linear effect present, but the confidence bands suggest we can't conclude it's significant.
+
+```{r avg-rating-rev.month, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  group_by(rev.month) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(rev.month, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red") +
+  labs(title = "Mean Rating by Month of Review",
+       x = "Month", y = "Rating") +
+  theme_bw()
+```
+### Time Effect: Review Hour
+The hour a review is submitted displays a non-linear relationship with confidence bands that suggest it's effect is significantly different from 0.
+
+```{r avg-rating-rev.hour, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  mutate(rev.hour = lubridate::hour(timestamp)) %>%
+  group_by(rev.hour) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(rev.hour, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red") +
+  labs(title = "Mean Rating by Hour of Review",
+       x = "Hour", y = "Rating") +
+  theme_bw()
+```
+### Time Effect: Review Day
+Looking at which day of the month a review is submitted, we see a similar effect to that of review month. There exists some non-linearity, but we can't say for sure that the effect is significantly different from the average. 
+
+```{r avg-rating-rev.day, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  group_by(rev.day) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(rev.day, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red")+
+  labs(title = "Mean Rating by Day of Review",
+       x = "Day", y = "Rating") +
+  theme_bw()
+```
+### Time Effect: Review Weekday
+As with the day of the review, we can't conclude that weekday has an effect significantly different from the mean rating.
+
+```{r avg-rating-weekday, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  group_by(rev.weekday) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(rev.weekday, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red")+
+  labs(title = "Mean Rating by Weekday of Review",
+       x = "Weekday", y = "Rating") +
+  theme_bw()
+```
+### Time Effect: Review Week
+The week a rating is submitted exhibits non-linearities, but our confidence that it's significantly different from the average only occurs at 2 isolated subsets of the domain.
+
+```{r avg-rating-rev.week, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  group_by(rev.week) %>% 
+  summarize(rating = mean(rating)) %>% 
+  ggplot(aes(rev.week, rating)) +
+  geom_point(shape = 21, fill = "orange", color = "black", size = 3) +
+  geom_smooth(color = "black") +
+  geom_hline(yintercept = mean(train$rating), col = "red")+
+  labs(title = "Mean Rating by Week of Review",
+       x = "Week", y = "Rating") +
+  theme_bw()
+```
+### Time Effect: Summary
+In summary, we see that release year, review year, the difference between them, and review hour exhibit non-linear relationships to the average ratings, while the other time related variables are inconclusive. 
+
+# Modeling User & Movie Effects
+The simplest model we can have is the model where the rating is equal to a constant plus some error. The constant that minimizes squared error loss is the overall average.
+
+We improve on the base model by including the conditional user and movie effect allowing our model to take on the form *residual  = rating - mu - movie_effect|mu - user_effect|movie_effect, mu*.
+
+## User & Movie Effects: Methodology
+To arrive at the final effects, we first investigate the effect of requiring users and movies to have a minimum number of reviews, the effect of normalizing the response vector, and the effect of regularization. Since normalization and centering differ by a constant, normalization is appropriate. 
+
+
+## Model Entry Criteria: Release Year
+The earliest released movie in the data set was released in 1915 during the Silent Era of Film. Since then, Hollywood has had 5 major eras:
+
+1. 1911 - 1927: Silent Era
+2. 1927 - 1930: Rise of the Talkies
+3. 1930 - 1948: Golden Age
+4. 1948 - 1965: Fall of the Studio System   
+5. 1965 - 1983: New Hollywood
+6. 1975 - present: Blockbuster Age
+
+We are limiting entry into the model to movies released on or after 1930 so as to coincide with the commencement of Hollywood's 'Golden Age'. Movies made prior to 1930 comprise .1% of all the data, so their exclusion is not expected to make a material impact on model performance.
+
+## Model Entry Criteria: Review Year
+In all of the training data there are only 2 ratings submitted in 1995. As such, we'll also limit entry to those ratings submitted starting in 1996.
+
+## Search Grid
+
+### Regularization
+A movie's effect on rating is measured as its average rating across all users and time and vice versa for users. Regularization wishes to account for the number of reviews attributable to each user or movie. The parameter of interest is lambda. 
+
+### Number of Reviews
+Regularization is one approach to accounting for the number of ratings a user or movie has. Another approach is to limit entry into the model to those users and movies with a minimum number of reviews. 
+
+### Grid Specification
+We perform a grid search to identify the optimal values for lambda and the minimum number of reviews.
+
+To test a sufficiently large range of parameter values, in a computationally efficient amount of time, we optimize each individually. By searching separately, we don't have to search the entire model space.
+
+#### Regularization
+```{r lambda-grid-plot, echo = F, message = F, warning = F, fig.align = "center"}
+regularization =
+  lambda.grid %>% 
+  group_by(lambda.u, lambda.m) %>% 
+  summarize(centered = mean(test.c),
+            normalized = mean(test.s))
+reg.c = 
+  regularization %>% 
+  ggplot() +
+  # Centered Ratings
+  geom_point(aes(x = lambda.u, y = centered, 
+                 fill = as.factor(lambda.m)),
+             shape = 21,
+             color = 'black',
+             size = 3.5) +
+  geom_line(aes(x = lambda.u, y = centered, 
+                color = as.factor(lambda.m)), 
+            show.legend = F) +
+  labs(title = "RMSE vs. User Lambda",
+       subtitle = 'Centered Ratings',
+       fill = "Movie Lambda", x = "User Lambda", y = 'RMSE') +
+  theme_bw()
+
+reg.n = 
+  regularization %>% 
+  ggplot() +
+  # Normalized Ratings
+  geom_point(aes(x = lambda.u, y = normalized, 
+                 fill = as.factor(lambda.m)),
+             shape = 21,
+             color = 'black',
+             size = 3.5) +
+  geom_line(aes(x = lambda.u, y = normalized, 
+                color = as.factor(lambda.m)), 
+            show.legend = F) +
+  labs(title = "RMSE vs. User Lambda",
+       subtitle = 'Normalized Ratings',
+       fill = "Movie Lambda", x = "User Lambda", y = 'RMSE') +
+  theme_bw()
+
+reg.c
+
+
+invisible(invisible(gc()))
+```
+```{r, echo = F, warning = F, message = F, fig.align = "center"}
+reg.n
+```
+
+From the plot above, we note that performance is better under regularization than centering and that in either case, we arrive at a minimum test error when lambda = 5. Since regularization has a positive effect on model performance, we must account for it when validating the minimum number of reviews. 
+
+#### Minimum Number of Reviews
+
+```{r Nmin.grid plot, echo = F, warning = F, message = FALSE, fig.align = "center"}
+nmin.cntr = 
+  lambda.grid %>% 
+  group_by(nrev.u, nrev.m) %>% 
+  summarize(centered = mean(test.c),
+            normalized = mean(test.s)) %>% 
+  ggplot() +
+  # Centered Ratings
+  geom_point(aes(x = nrev.m, y = centered, 
+                 fill = as.factor(nrev.u)),
+             shape = 21, 
+             color = 'black', 
+             size = 3.5) +
+  geom_line(aes(x = nrev.m, y = centered, 
+                color = as.factor(nrev.u)),
+            show.legend = FALSE) +
+  labs(title = "RMSE vs Min. Reviews",
+       subtitle = "Centered Ratings",
+       x = "Movie N", y = "RMSE", 
+       fill = "User N") +
+  theme_bw()
+
+nmin.norm = 
+  lambda.grid %>% 
+  group_by(nrev.u, nrev.m) %>% 
+  summarize(centered = mean(test.c),
+            normalized = mean(test.s)) %>% 
+  ggplot() +
+  # Normalized Ratings
+  geom_point(aes(x = nrev.m, y = normalized, 
+                 fill = as.factor(nrev.u)),
+             shape = 21, 
+             color = 'black', 
+             size = 3.5) +
+  geom_line(aes(x = nrev.m, y = normalized, 
+                color = as.factor(nrev.u)),
+            show.legend = FALSE) +
+  labs(title = "RMSE vs Min. Reviews",
+       subtitle = "Normalized Ratings",
+       x = "Movie N", y = "RMSE", 
+       fill = "User N") +
+  theme_bw()
+
+nmin.cntr
+
+invisible(invisible(gc()))
+```
+```{r, echo = F, warning = F, message = F, fig.align = "center"}
+nmin.norm
+```
+
+
+We see that setting a minimum number of reviews for movies doesn't have a significant impact on the test error in either the centered or normalized contexts. After 20 reviews, there's not much of a difference in test error. 
+
+Given the above, we'll normalize the ratings & require users and movies to have a minimum of 20 movies before proceeding to calculate the user and movie effects. Before doing so, it's worth considering the data we lose by requiring a minimum number of movies.  
+
+#### Data Loss
+```{r min-reviews-data-loss, echo = F, warning = F, message = F, fig.align = "center"}
+data_loss = map(seq(10,100, by = 10), 
+                \(cutoff){
+                  users = users_num_reviews %>% filter(nrev.user < cutoff)
+                  rows  = edx %>% filter(userID %in% users$userID) %>% nrow()
+                  lost  = rows/nrow(edx)
+                  
+                  # number of unique userID's: 69878 
+                  tibble(cutoff = cutoff, 
+                         nusers = nrow(users), 
+                         users_lost = nrow(users)/69878, 
+                         rows_lost = rows, 
+                         data_lost = lost)
+                }) %>% bind_rows()
+
+data_loss %>% 
+  ggplot() + 
+  geom_point(aes(cutoff, data_lost, fill = "blue"), shape = 21, size = 2.5) +
+  geom_point(aes(cutoff, users_lost, fill = "tomato"), shape = 21, size = 2.5) +
+  scale_fill_manual(labels = c("Data", "Users"),
+                    values = c("blue", "tomato")) +
+  theme_bw() +
+  labs(title = "Lost Users and Data",
+       x = "Required Number of Reviews", y = "Proportion Lost",
+       fill = "Legend",
+       subtitle = "How much do we lose as we increase\nthe minimum required number of reviews?")
+
+rm(data_loss)
+invisible(invisible(gc()))
+```
+Above, we saw that test error beings accelerating upwards past a minimum of 20 reviews. Here we see a correspondence - after a minimum of 20 reviews, the the rate at which users and data is lost accelerates. At a minimum of 20, we lose 5% of users and less than 1% of the data.
+
+## Final Movie & User Effect
+After removing the user and movie effects from the normalized ratings, we get a train error of 0.8061 and a test error of 0.8154. Looking at the distribution of residuals, we see their distribution is more highly peaked and more highly concentrated about its mean than a normal distribution. A Shapiro-Wilk test confirms non-normality.
+
+```{r final-user-movie-effects, echo = F, message = F, warning = F}
+#train and test rmse
+rmse.df(train$residual)
+rmse.df(test$residual)
+
+```
+```{r shapiro-wilk-test, echo = F, warning = F, message = F}
+# sample 5000 residuals
+samp = sample(train$residual, 5000)
+
+# normality test
+shapiro.test(samp)
+```
+
+Further, they exhibit some skew, affecting how the residuals behave in the tails. The normal QQ plot confirms this visually, reflecting the behavior in the histogram above. 
+```{r residual-distribution, echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center" }
+
+# set seed
+suppressWarnings(set.seed(1936, sample.kind = "Rounding"))
+# generate random normal data
+sim.data <- rnorm(n = nrow(train), 
+                  mean = mean(train$residual), 
+                  sd = sd(train$residual))
+# Histogram
+train %>% 
+  mutate(simulated = sim.data) %>% 
+  ggplot()+
+  geom_histogram(aes(residual, fill = hist.fill), 
+                 color = "black") +
+ 
+  geom_histogram(aes(simulated, fill = norm.fill),
+                color = "black", alpha = 0.35) +
+  scale_fill_manual(labels = c("Actual", "Simulated"),
+                   values = c(hist.fill, norm.fill)) +
+  theme_bw() +
+  labs(title = "Distribution of Residuals vs. Simulated Normal Data",
+       fill = "Legend", caption = "Data: Movielens 10M")
+
+rm(rsd_bw, sim.data)
+invisible(invisible(gc()))
+```
+ 
+```{r rsd-qq-plot, echo = F, warning = F, message = F}
+# qq plot
+qqnorm(samp)
+qqline(samp)
+```
+
+# Feature Engineering
+Engineering new features allows us to gain further insight and expose more intricate relationships among the variables than we can view at the current resolution. In the current setting we will encode two types of information: information about the release year and information about movie popularity. 
+
+## Movie Rank
+We assign a movie to 1 of 4 strata according to how its number of reviews compares to other movies. Specifically, we'll employ the 25th, 50th, and 75th percentiles as cutoffs.
+
+The values of those quantiles for the training data are N = c(58, 174, and 678), so we'll assign a movie's rank accordingly and investigate if it exhibits a relationship to time in any way. 
+
+## Movie Era
+Above, we saw a non-linear relationship between release year and the average residual. We also discussed the various eras Hollywood has experienced since 1930. To account for the era in which a movie is made, we create an era variable according to the time frame we discussed above. Doing so will allow us to expose a non-linear relationship between the release year and the residual.
+
+
+
+``` {r residual-year-era-rank, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  group_by(era, rank.m, year) %>% 
+  summarize(residual = mean(residual)) %>% 
+  ggplot(aes(x = year, y = residual)) +
+  geom_point(aes(color = era), 
+             size = 3) +
+  geom_smooth(aes(color = era),
+              linewidth = 1.2, 
+              show.legend = FALSE) +
+  geom_hline(yintercept = 0, col = 'red') +
+  theme_bw() +
+  facet_wrap(~ rank.m) +
+  labs(title = "Residual ~ Year x Era x Rank",
+       subtitle = "Faceted by Rank",
+       color = "Era",
+       caption = "Data: Movielens 10m") 
+```
+There's a clear interaction between era and rank across release years. As we go from rank to rank, the non-linear relationship between era and time changes. As such, a function of time that takes the era into account should also take the movie's rank into account as well. 
+
+
+## Changing Relationships
+Above, we noted a non-linear relationship between the average rating and the difference between the year of review and the year of release. After adjusting for the user and movie effects, that relationship no longer holds. 
+
+```{r era-time.since, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  mutate(time.since = rev.year-year)%>%
+  group_by(time.since) %>% 
+  summarize(residual = mean(residual)) %>% 
+  ggplot() +
+  geom_point(aes(time.since, residual), 
+             shape = 21, 
+             fill = "tomato",
+             color = 'black', 
+             size = 3.5) +
+  geom_smooth(aes(time.since, residual), 
+              color = "black", 
+              linewidth = 1.2, 
+              show.legend = FALSE) +
+  geom_hline(yintercept = 0, col = 'red') +
+  theme_bw() +
+  labs(title = "Mean Residual by Time Since Release",
+       fill = "Era",
+       caption = "Data: Movielens 10m") 
+```
+
+# Estimating The Time Effect
+
+## Rank, Era, & Year Effect 
+Above, we observed an interactive effect between the release year, the era, and the movie's rank. In this context, the era variable effectively acts as the knots, allowing us to visualize the non-linear relationship between rank, year, and residual.
+
+We consider two models: loess & gam. For each we vary their respective complexity parameters and evaluate their performance. In both cases we compare two methodologies. In the first, we split the data by rank and fit a different model on each subset. In the second, we use the entire data set and model the interactions directly.
+
+The primary benefit of splitting the data by rank is computational efficiency. On average, splitting the data yields a 93.47% decrease in fitting time at the cost of a 0.13% increase in the test error. 
+
+Looking at the split data, we see that loess and gam both perform comparably with loess outperforming gam by a marginal difference.
+
+```{r, echo = F, message = F, warning = F}
+gam.grid %>%
+  group_by(rank)%>%
+  summarize(gam.rmse = mean(test.rmse)) %>%
+  left_join(
+    loess.grid %>%
+      group_by(rank) %>%
+      summarize(loess.rmse = mean(test.rmse)),
+    by = "rank"
+  ) %>%
+  as.data.frame() %>%
+  mutate(difference = gam.rmse - loess.rmse)
+```
+
+Comparing complexity to test error, for both gam and loess we see a reduction in the test error with the GAMs leveling off after a K of about 13 or 14, with negligible decreases in test error thereafter.
+
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+gam.grid %>%
+  group_by(ks) %>%
+  summarize(rmse = mean(test.rmse)) %>%
+  ggplot(aes(ks, rmse)) +
+  geom_point(shape = 21, fill = "tomato", color = "black", size = 2) +
+  theme_bw() + 
+  labs(title = "GAM: Complexity vs. Test Error",
+       caption =  "Data: Movielens 10M", x = "k (in order of  increasing complexity)")
+```
+For loess, as the complexity increases, we see an almost cubic relationship emerge between complexity and test error. 
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+loess.grid %>%
+  group_by(span) %>%
+  summarize(rmse = mean(test.rmse)) %>%
+  ggplot(aes(span, rmse)) +
+  scale_x_reverse() + 
+  geom_point(shape = 21, fill = "tomato", color = "black", size = 2) +
+  theme_bw() + 
+  labs(title = "Loess: Complexity vs. Test Error",
+       caption =  "Data: Movielens 10M", x = "span (in order of  increasing complexity)")
+```
+Comparing the estimated functional using the optimal complexity parameters yields the following two graphs. Underneath we have the original plot with each model's estimate of the conditional expectation. Comparing the two, we see that the GAM fit a much smoother function than loess does, despite the fact that loess has a slight analytic edge. 
+
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+train %>%
+  group_by(rank.m, era, year) %>% 
+  summarize(residual = mean(residual),
+            gam.rhat = mean(split.gam14)) %>% 
+  ggplot(aes(year, residual)) +
+  geom_point(aes(fill = era),
+             shape = 21, color = "black", 
+             size = 2) +
+  geom_smooth(aes(color = era), show.legend = F) +
+  geom_point(aes(year, gam.rhat),
+             fill = "tomato", shape = 21, size = 2, color = "black",
+             inherit.aes = F) +
+  theme_bw() +
+  facet_wrap(~rank.m) +
+  labs(title = "GAM: Estimated Functional",
+       caption = "Data: Movielens 10M")
+```
+```{r, echo = F, warning = F, message= F, fig.align = "center"}
+train %>%
+  group_by(rank.m, era, year) %>% 
+  summarize(residual = mean(residual),
+            loess.rhat = mean(split.loe0.1)) %>% 
+  ggplot(aes(year, residual)) +
+  geom_point(aes(fill = era),
+             shape = 21, color = "black", 
+             size = 2) +
+  geom_smooth(aes(color = era), show.legend = F) +
+  geom_point(aes(year, loess.rhat),
+             fill = "tomato", shape = 21, size = 2, color = "black",
+             inherit.aes = F) +
+  theme_bw() +
+  facet_wrap(~rank.m) +
+  labs(title = "Loess: Estimated Functional",
+       caption = "Data: Movielens 10M", fill = "Movie Era")
+```
+
+Combining the estimates of both models in a single ensemble will produce a model with more robust estimates of the true functional. Before fitting the model we have a train error of 0.8067081. Whether using the ensemble or either of its individual contributors, we still see a drop in the train error down to an average of 0.8063648. 
+
+```{r, echo = F, message = F, warning = F}
+train %>%
+  mutate(ens.rhat = (split.gam14 + split.loe0.1)/2,
+         ensemble = residual - ens.rhat,
+         gam = residual - split.gam14,
+         loess = residual - split.loe0.1) %>%
+  summarize(across(c(residual, ensemble, gam, loess), rmse.df)) %>%
+  pivot_longer(cols = colnames(.),
+               names_to = "model",
+               values_to = "rmse") %>%
+  as.data.frame()
+  
+```
+
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+gam.grid.full %>%
+  ggplot(aes(ks, test.rmse)) +
+  geom_point() + geom_line() + 
+  theme_bw() + 
+  labs(title = "GAM: Test Error vs. RMSE",
+       subtitle = "model: residual ~ rank + s(year, by = rank)")
+```
+
+Comparing to the models fit on the entire data set we have the following set of estimated conditional expectations for GAM and Loess. For both, using the entire data set and fitting a more complicated model resulted in much more linear expectations for ranks 1 and 2 when compared to the functionals estimated using the split data. 
+
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+train %>%
+  group_by(rank.m, era, year) %>% 
+  summarize(residual = mean(residual),
+            gam = mean(full.gam14)) %>% 
+  ggplot(aes(year, residual)) +
+  geom_point(aes(fill = era),
+             shape = 21, color = "black", 
+             size = 2) +
+  geom_smooth(aes(color = era), show.legend = F) +
+  geom_point(aes(year, gam),
+             fill = "tomato", shape = 21, size = 2, color = "black",
+             inherit.aes = F) +
+  theme_bw() +
+  facet_wrap(~rank.m) +
+  labs(title = "GAM: Estimated Functional",
+       subtitle = "model: residual ~ rank + s(year, by = rank)",
+       caption = "Data: Movielens 10M", fill = "Movie Era")
+  
+```
+
+```{r, echo = F, warning = F, message = F, fig.align = "center"}
+train %>%
+  group_by(rank.m, era, year) %>% 
+  summarize(residual = mean(residual),
+            loess = mean(full.loe0.1)) %>% 
+  ggplot(aes(year, residual)) +
+  geom_point(aes(fill = era),
+             shape = 21, color = "black", 
+             size = 2) +
+  geom_smooth(aes(color = era), show.legend = F) +
+  geom_point(aes(year, loess),
+             fill = "tomato", shape = 21, size = 2, color = "black",
+             inherit.aes = F) +
+  theme_bw() +
+  facet_wrap(~rank.m) +
+  labs(title = "Loess: Estimated Functional",
+       subtitle = "model: residual ~ rank + lp(year, rank)",
+       caption = "Data: Movielens 10M", fill = "Movie Era")
+```
+Analytically, we get better train performance from using the split data versus the full data set so, when we train on all of edx, we'll split the data by rank first. 
+
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+train %>% 
+  mutate(gam.full = residual - full.gam14,
+         loe.full = residual - full.loe0.1,
+         gam.split = residual - split.gam14,
+         loe.split = residual - split.loe0.1) %>% 
+  summarize(across(c(gam.full, loe.full, gam.split, loe.split), rmse.df)) %>% 
+  pivot_longer(cols = colnames(.), names_to = "model", values_to = "rmse") %>%
+  mutate(data = 
+           case_when(
+             model == "gam.full" | model == "loe.full"  ~ "full",
+             model == "gam.split"| model == "loe.split" ~ "split"
+           ),
+         model = 
+           case_when(
+             model == "gam.full" | model == "gam.split" ~ "gam",
+             model == "loe.full" | model == "loe.split" ~ "loess",
+           )) %>%
+  as.data.frame()
+```
+
+After fitting the model on the entire training set, the error is reduced by a good amount. However, after predicting on the test set, we get an *increase* in the test error over not estimating a time effect. 
+
+
+```{r, echo = F, message = F, warning = F, fig.align = "center"}
+edx %>%
+  mutate(rsd = residual, 
+         rsd.ens = residual - ensemble,
+         rsd.gam = residual - gam.rhat,
+         rsd.loe = residual - loe.rhat) %>%
+  summarize(across(starts_with("rsd"), rmse.df)) %>%
+  pivot_longer(cols = colnames(.),
+               names_to = "residual",
+               values_to = "rmse") %>%
+  as.data.frame()
+```
+
+```{r, echo = F, message = F, warning = F}
+final_holdout_test %>%
+  mutate(rsd = residual, 
+         rsd.ens = residual - ensemble,
+         rsd.gam = residual - gam.rhat,
+         rsd.loe = residual - loe.rhat) %>%
+  summarize(across(starts_with("rsd"), rmse.df)) %>%
+  pivot_longer(cols = colnames(.),
+               names_to = "residual",
+               values_to = "rmse") %>%
+  as.data.frame()
+```
+
+# Conclusion
+After validating model entry criteria and the optimal level of regularization, we estimated the user and movie effects, allowing us to then estimate the effect of time. By placing knots at the boundaries of Hollywood Eras allowed us to uncover a non-linear relationship between release year and residual as faceted by movie rank. 
+
+Though our models are able to capture the non-linearities present in the data, they do not necessarily aid in our understanding as the normalized response vector, adjusted for users and movies, yields a test rmse of 0.7951653	 while the estimation of the time effect by ensemble actually increases the test rmse by a marginal amount. 
+
+Within the current model are a number of latent variables such as cast, director, budget, gross revenue, etc., all of which factor into a movie's popularity but were not included within this analysis. Attempts were made to source this information by scraping the web, but the disparity of sources, lack of complete data, and other issues prevented their inclusion within the model. A more sophisticated model would seek to include those variables. 
